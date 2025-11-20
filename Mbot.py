@@ -1,6 +1,7 @@
 import logging
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+import asyncio
 from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -90,6 +91,60 @@ def parse_date_with_short_year(date_text):
     else:
         return None
 
+# Функция для отправки ежедневных напоминаний
+async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Запуск ежедневной проверки напоминаний...")
+
+    conn = context.bot_data['db_connection']
+    cursor = conn.cursor()
+
+    today = datetime.now().date()
+
+    # Находим все активные товары (гарантия еще не истекла)
+    cursor.execute('''
+        SELECT DISTINCT user_id, product_name, warranty_date 
+        FROM products 
+        WHERE warranty_date >= ?
+    ''', (today.strftime('%Y-%m-%d'),))
+
+    products = cursor.fetchall()
+
+    reminders_sent = 0
+
+    for user_id, product_name, warranty_date_str in products:
+        warranty_date = datetime.strptime(warranty_date_str, '%Y-%m-%d').date()
+        days_left = (warranty_date - today).days
+
+        # ✅ ПРАВИЛЬНО: уведомления ТОЛЬКО за 30, 14, 7, 1, 0 дней
+        if days_left in [30, 14, 7, 1, 0]:
+            if days_left == 0:
+                message = f"⚠️ *СРОЧНО!* Гарантия на '{product_name}' истекает сегодня!"
+            elif days_left == 1:
+                message = f"🔔 Завтра истекает гарантия на '{product_name}'"
+            elif days_left == 7:
+                message = f"📢 Неделя осталась! Гарантия на '{product_name}' истекает через 7 дней"
+            elif days_left == 14:
+                message = f"📅 Напоминание: до окончания гарантии на '{product_name}' осталось 14 дней"
+            elif days_left == 30:
+                message = f"📅 Напоминание: до окончания гарантии на '{product_name}' остался 1 месяц"
+
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                reminders_sent += 1
+                logger.info(
+                    f"Отправлено напоминание пользователю {user_id} для товара {product_name} (осталось {days_left} дней)")
+
+                # Небольшая задержка между сообщениями чтобы не превысить лимиты Telegram
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+
+    logger.info(f"Ежедневная проверка завершена. Отправлено напоминаний: {reminders_sent}")
 
 # Старт бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,7 +350,7 @@ async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # Обработка выбора товара для редактирования
-async def edit_product_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def edit_product_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
@@ -347,21 +402,18 @@ async def edit_product_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-
-        return EDIT_NAME
     else:
         await query.edit_message_text("❌ *Товар не найден.*", parse_mode='Markdown')
-        return ConversationHandler.END
 
 
 # Обработка выбора действия в меню управления товаром
-async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     if query.data == "back_to_list":
         await show_products_from_callback(update, context)
-        return ConversationHandler.END
+        return
 
     if query.data == "delete_product":
         # Переходим к подтверждению удаления
@@ -394,41 +446,36 @@ async def edit_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
-                return ConversationHandler.END
+        else:
+            await query.edit_message_text("❌ *Ошибка: товар не найден.*", parse_mode='Markdown')
 
-        await query.edit_message_text("❌ *Ошибка: товар не найден.*", parse_mode='Markdown')
-        return ConversationHandler.END
-
-    if query.data == "edit_name":
-        # Отправляем новое сообщение с клавиатурой отмены вместо редактирования существующего
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="*✏️ Введите новое название товара:*",
-            reply_markup=cancel_menu(),
+    elif query.data == "edit_name":
+        # Редактируем текущее сообщение, убирая инлайн-клавиатуру
+        await query.edit_message_text(
+            "*✏️ Введите новое название товара:*",
+            reply_markup=None,  # Убираем инлайн-клавиатуру для текстового ввода
             parse_mode='Markdown'
         )
         return EDIT_NAME
 
     elif query.data == "edit_date":
-        # Отправляем новое сообщение с клавиатурой отмены вместо редактирования существующего
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="*📅 Введите новую дату окончания гарантии (ДД.ММ.ГГ):*",
-            reply_markup=cancel_menu(),
+        # Редактируем текущее сообщение, убирая инлайн-клавиатуру
+        await query.edit_message_text(
+            "*📅 Введите новую дату окончания гарантии (ДД.ММ.ГГ):*",
+            reply_markup=None,  # Убираем инлайн-клавиатуру для текстового ввода
             parse_mode='Markdown'
         )
         return EDIT_DATE
-
-
 # Обработка отмены удаления
 async def cancel_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    # Возвращаемся к меню управления товаром
+    # Просто возвращаемся к меню управления товаром
     product_id = context.user_data.get('editing_product_id')
 
     if product_id:
+        # Получаем актуальную информацию о товаре из БД
         conn = context.bot_data['db_connection']
         cursor = conn.cursor()
         cursor.execute(
@@ -452,7 +499,7 @@ async def cancel_delete_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("↩️ Назад к списку", callback_data="back_to_list")]
             ]
 
-            # Убрали статус "Активна"
+            # Статус товара
             status = None
             if days_left < 0:
                 status = "❌ Просрочено"
@@ -473,7 +520,17 @@ async def cancel_delete_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
-
+        else:
+            # Если товар вдруг не найден (очень редкий случай)
+            await query.edit_message_text(
+                "❌ *Товар не найден в базе данных.*",
+                parse_mode='Markdown'
+            )
+    else:
+        await query.edit_message_text(
+            "❌ *Не удалось найти идентификатор товара.*",
+            parse_mode='Markdown'
+        )
 
 # Обработка подтверждения удаления
 async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -500,7 +557,7 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
             cursor.execute('DELETE FROM products WHERE id = ?', (product_id,))
             conn.commit()
 
-            # Удаляем сообщение с инлайн-клавиатурой и отправляем новое с сообщением об удалении
+            # Удаляем сообщение с инлайн-клавиатурой и отправляем новое сообщение
             await query.delete_message()
             await context.bot.send_message(
                 chat_id=query.from_user.id,
@@ -512,10 +569,18 @@ async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_T
             # Очищаем данные о редактировании
             context.user_data.pop('editing_product_id', None)
         else:
-            await query.edit_message_text("❌ *Товар не найден.*", parse_mode='Markdown')
+            # Если товар не найден, показываем сообщение об ошибке
+            await query.edit_message_text(
+                "❌ *Товар не найден в базе данных.*",
+                reply_markup=None,
+                parse_mode='Markdown'
+            )
     else:
-        await query.edit_message_text("❌ *Ошибка: товар не найден.*", parse_mode='Markdown')
-
+        await query.edit_message_text(
+            "❌ *Ошибка: товар не найден.*",
+            reply_markup=None,
+            parse_mode='Markdown'
+        )
 
 # Обработка изменения названия
 async def edit_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -560,6 +625,7 @@ async def edit_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     conn.commit()
 
+    # Отправляем новое сообщение с обычной клавиатурой
     await update.message.reply_text(
         f"✅ *Название товара успешно изменено на:* {new_name}",
         reply_markup=main_menu(),
@@ -568,7 +634,6 @@ async def edit_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data.pop('editing_product_id', None)
     return ConversationHandler.END
-
 
 # Обработка изменения даты
 async def edit_product_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -635,7 +700,6 @@ async def edit_product_date(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return EDIT_DATE
 
-    # Обновление в базе данных
     conn = context.bot_data['db_connection']
     cursor = conn.cursor()
 
@@ -645,23 +709,31 @@ async def edit_product_date(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     conn.commit()
 
-    days_left = (warranty_date - today).days
-
+    # Отправляем новое сообщение с обычной клавиатурой
     await update.message.reply_text(
-        f"✅ *Дата гарантии успешно изменена!*\n\n"
-        f"📅 *Новая дата:* {warranty_date.strftime('%d.%m.%Y')}\n"
-        f"⏳ *Осталось дней:* {days_left}",
+        f"✅ *Дата гарантии успешно изменена на:* {warranty_date.strftime('%d.%m.%Y')}",
         reply_markup=main_menu(),
         parse_mode='Markdown'
     )
 
     context.user_data.pop('editing_product_id', None)
     return ConversationHandler.END
+# Показать товары из callback (для кнопки "Назад")
 
+# Функция отмены редактирования для ConversationHandler
+async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop('editing_product_id', None)
+    await update.message.reply_text(
+        "❌ *Редактирование отменено.*",
+        reply_markup=main_menu(),
+        parse_mode='Markdown'
+    )
+    return ConversationHandler.END
 
-# Показать товары из callback (для возврата из редактирования/удаления)
 async def show_products_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    await query.answer()
+
     user_id = query.from_user.id
     conn = context.bot_data['db_connection']
     cursor = conn.cursor()
@@ -675,6 +747,7 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
     if not products:
         await query.edit_message_text(
             "*📭 У вас пока нет добавленных товаров.*\n\n*Нажмите* \"📦 Добавить товар\"*, чтобы добавить первый товар.*",
+            reply_markup=main_menu(),
             parse_mode='Markdown'
         )
         return
@@ -682,7 +755,6 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
     today = datetime.now().date()
     message = "*📋 Ваши товары:*\n\n"
 
-    # Создаем клавиатуру с товарами
     keyboard = []
 
     for product in products:
@@ -690,7 +762,6 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
         warranty_date = datetime.strptime(warranty_date_str, '%Y-%m-%d').date()
         days_left = (warranty_date - today).days
 
-        # Убрали статус "Активна" - показываем только предупреждения
         if days_left < 0:
             status = "❌ Просрочено"
         elif days_left == 0:
@@ -702,7 +773,6 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
         else:
             status = None
 
-        # Добавляем информацию о товаре в сообщение
         message += f"📦 *{product_name}*\n"
         message += f"📅 *До:* {warranty_date.strftime('%d.%m.%Y')}\n"
         message += f"⏳ *Осталось:* {days_left} дней\n"
@@ -710,7 +780,6 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
             message += f"📊 *{status}*\n"
         message += "\n"
 
-        # Добавляем кнопку редактирования для каждого товара
         display_name = product_name[:30] + "..." if len(product_name) > 30 else product_name
         keyboard.append([
             InlineKeyboardButton(f"✏️ {display_name}", callback_data=f"edit_{product_id}")
@@ -723,145 +792,84 @@ async def show_products_from_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
-# Проверка и отправка уведомлений
-async def check_warranties(context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = context.bot_data['db_connection']
-    cursor = conn.cursor()
-
-    today = datetime.now().date()
-
-    # Находим товары, по которым нужно отправить уведомления
-    cursor.execute('''
-        SELECT user_id, product_name, warranty_date 
-        FROM products 
-        WHERE warranty_date >= date('now')
-    ''')
-    products = cursor.fetchall()
-
-    for user_id, product_name, warranty_date_str in products:
-        warranty_date = datetime.strptime(warranty_date_str, '%Y-%m-%d').date()
-        days_left = (warranty_date - today).days
-
-        # Определяем, нужно ли отправлять уведомление
-        if days_left in [30, 14, 7, 1, 0]:
-            if days_left == 0:
-                message = f"""
-*⚠️ ГАРАНТИЯ ЗАКОНЧИЛАСЬ!*
-
-📦 *{product_name}*
-📅 *Дата окончания:* {warranty_date.strftime('%d.%m.%Y')}
-
-💡 *Рекомендуем проверить товар на наличие дефектов.*
-                """
-            else:
-                message = f"""
-*🔔 СКОРО ЗАКОНЧИТСЯ ГАРАНТИЯ*
-
-📦 *{product_name}*
-📅 *Окончание:* {warranty_date.strftime('%d.%m.%Y')}
-⏳ *Осталось дней:* {days_left}
-
-💡 *Совет:* Проверьте работу товара до окончания гарантии.
-                """
-
-            try:
-                await context.bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
-
-
-# Обработка текстовых сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# Обработка текстовых сообщений (главное меню)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text
 
     if text == "📦 Добавить товар":
         await add_product_start(update, context)
     elif text == "📋 Мои товары":
         await show_products(update, context)
-    elif text == "↩️ Отмена":
-        await cancel_add(update, context)
     else:
         await update.message.reply_text(
-            "*Я не понимаю эту команду. Используйте кнопки меню ниже* 👇",
-            reply_markup=main_menu(),
-            parse_mode='Markdown'
+            "Используйте кнопки меню для навигации",
+            reply_markup=main_menu()
         )
 
 
-# Главная функция
+# Основная функция
 def main() -> None:
+    # Создаем Application с правильной инициализацией
+    application = (
+        Application.builder()
+        .token("8576950098:AAEae5qOnqtWCoIFgpWA43ILZfjK7EktmNU")  # ЗАМЕНИТЕ НА ВАШ ТОКЕН
+        .build()
+    )
+
     # Инициализация базы данных
     conn = init_db()
-
-    # ⚠️ ЗАМЕНИТЕ ЭТОТ ТОКЕН НА ВАШ НАСТОЯЩИЙ ТОКЕН ОТ @BotFather ⚠️
-    BOT_TOKEN = "8576950098:AAEae5qOnqtWCoIFgpWA43ILZfjK7EktmNU"  # Замените на ваш токен!
-
-    # Создаем Application и передаем токен бота
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Сохраняем соединение с БД в bot_data
     application.bot_data['db_connection'] = conn
 
-    # Обработчики команд
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
 
     # ConversationHandler для добавления товара
     add_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^(📦 Добавить товар)$'), add_product_start)],
+        entry_points=[MessageHandler(filters.Text(["📦 Добавить товар"]), add_product_start)],
         states={
             ADD_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
             ADD_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_date)],
         },
-        fallbacks=[MessageHandler(filters.Regex('^(↩️ Отмена)$'), cancel_add)],
+        fallbacks=[MessageHandler(filters.Text(["↩️ Отмена"]), cancel_add)],
+        per_message=False  # Явно указываем для избежания предупреждения
     )
 
     # ConversationHandler для редактирования товара
     edit_conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(edit_product_choice, pattern='^edit_')],
+        entry_points=[CallbackQueryHandler(edit_product_choice, pattern=r"^edit_\d+$")],
         states={
-            EDIT_NAME: [
-                CallbackQueryHandler(edit_choice_handler,
-                                     pattern='^(edit_name|edit_date|delete_product|back_to_list)$'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_name)
-            ],
-            EDIT_DATE: [
-                CallbackQueryHandler(edit_choice_handler,
-                                     pattern='^(edit_name|edit_date|delete_product|back_to_list)$'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_date)
-            ],
+            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_name)],
+            EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_date)],
         },
-        fallbacks=[MessageHandler(filters.Regex('^(↩️ Отмена)$'), cancel_edit)],
+        fallbacks=[
+            MessageHandler(filters.Text(["↩️ Отмена"]), cancel_edit),  # Используем новую функцию
+        ],
+        per_message=False
     )
 
     application.add_handler(add_conv_handler)
     application.add_handler(edit_conv_handler)
 
-    # Обработчики callback запросов
-    application.add_handler(CallbackQueryHandler(confirm_delete_handler, pattern='^confirm_delete$'))
-    application.add_handler(CallbackQueryHandler(cancel_delete_handler, pattern='^cancel_delete$'))
-    application.add_handler(CallbackQueryHandler(show_products_from_callback, pattern='^back_to_list$'))
+    # Отдельные обработчики для callback queries
+    application.add_handler(
+        CallbackQueryHandler(edit_choice_handler, pattern=r"^(edit_name|edit_date|delete_product)$"))
+    application.add_handler(CallbackQueryHandler(cancel_delete_handler, pattern=r"^cancel_delete$"))
+    application.add_handler(CallbackQueryHandler(confirm_delete_handler, pattern=r"^confirm_delete$"))
+    application.add_handler(CallbackQueryHandler(show_products_from_callback, pattern=r"^back_to_list$"))
 
-    # Обработчик текстовых сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Планировщик для проверки гарантий (каждый день в 10:00)
-    job_queue = application.job_queue
-    job_queue.run_daily(check_warranties, time=time(hour=10, minute=0))
-
-    # Запуск бота
-    print("Бот запущен...")
-    application.run_polling()
-
-
-# Функция отмены редактирования
-async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop('editing_product_id', None)
-    await update.message.reply_text(
-        "❌ *Редактирование отменено.*",
-        reply_markup=main_menu(),
-        parse_mode='Markdown'
+    # Запускаем ежедневные напоминания в 13:00
+    application.job_queue.run_daily(
+        send_daily_reminders,
+        time=time(hour=13, minute=0),  # 13:00 по времени сервера
+        name="daily_reminders"
     )
-    return ConversationHandler.END
+
+    logger.info("Бот запущен с ежедневными напоминаниями в 13:00")
+
+    # Запускаем бота
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
